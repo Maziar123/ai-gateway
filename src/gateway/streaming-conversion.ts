@@ -28,6 +28,8 @@ import type {
 } from '../types';
 import { asNumber, asString, extractTextFromPart, isObject } from '../utils';
 
+const OPTIMISTIC_OPENAI_FINISH_GRACE_MS = 1_000;
+
 interface OpenAIResponsesRelayState {
   createdAt: number;
   nextSequenceNumber: number;
@@ -401,38 +403,69 @@ export async function* relayOptimisticOpenAIChatStreamTurn(
 ): AsyncGenerator<string> {
   const collectionState = createOpenAINonStreamCollectionState();
 
-  for await (const chunk of parseSseChunks(upstreamResponse, abortSignal)) {
-    const data = chunk.data.trim();
-    if (!data || data === '[DONE]') {
-      continue;
-    }
+  const streamAbortController = new AbortController();
+  const forwardAbort = () => streamAbortController.abort(abortSignal?.reason);
+  let finishGraceTimer: ReturnType<typeof setTimeout> | undefined;
 
-    let payload: unknown;
-    try {
-      payload = JSON.parse(data);
-    } catch {
-      continue;
-    }
+  if (abortSignal?.aborted) {
+    forwardAbort();
+  } else {
+    abortSignal?.addEventListener('abort', forwardAbort, { once: true });
+  }
 
-    if (!isObject(payload) || isOpenAIResponsesStreamEvent(payload)) {
-      continue;
-    }
+  try {
+    for await (const chunk of parseSseChunks(upstreamResponse, streamAbortController.signal)) {
+      const data = chunk.data.trim();
+      if (!data) {
+        continue;
+      }
+      if (data === '[DONE]') {
+        break;
+      }
 
-    collectOpenAINonStreamStateFromChatChunk(collectionState, payload);
-    const sanitizedPayload = stripOpenAIChatChunkToolCallsAndFinish(payload);
-    if (!sanitizedPayload) {
-      continue;
-    }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        continue;
+      }
 
-    const frames =
-      relay.sourceAdapterKey === 'openai_responses'
-        ? emitOpenAIResponsesFramesFromChatChunk(relay.state, sanitizedPayload, relay.tools)
-        : emitAnthropicFramesFromOpenAIChatChunk(relay.state, sanitizedPayload);
-    for (const frame of frames) {
-      yield relay.sourceAdapterKey === 'openai_responses'
-        ? normalizeOpenAIResponsesSseFrame(relay.state, frame)
-        : frame;
+      if (!isObject(payload) || isOpenAIResponsesStreamEvent(payload)) {
+        continue;
+      }
+
+      collectOpenAINonStreamStateFromChatChunk(collectionState, payload);
+      const sanitizedPayload = stripOpenAIChatChunkToolCallsAndFinish(payload);
+      if (sanitizedPayload) {
+        const frames =
+          relay.sourceAdapterKey === 'openai_responses'
+            ? emitOpenAIResponsesFramesFromChatChunk(relay.state, sanitizedPayload, relay.tools)
+            : emitAnthropicFramesFromOpenAIChatChunk(relay.state, sanitizedPayload);
+        for (const frame of frames) {
+          yield relay.sourceAdapterKey === 'openai_responses'
+            ? normalizeOpenAIResponsesSseFrame(relay.state, frame)
+            : frame;
+        }
+      }
+
+      if (!collectionState.finishReason) {
+        continue;
+      }
+      if (Object.keys(collectionState.usage).length > 0) {
+        break;
+      }
+      if (!finishGraceTimer) {
+        finishGraceTimer = setTimeout(() => {
+          streamAbortController.abort(new Error('OpenAI stream finish grace period elapsed.'));
+        }, OPTIMISTIC_OPENAI_FINISH_GRACE_MS);
+        finishGraceTimer.unref?.();
+      }
     }
+  } finally {
+    if (finishGraceTimer) {
+      clearTimeout(finishGraceTimer);
+    }
+    abortSignal?.removeEventListener('abort', forwardAbort);
   }
 
   result.upstreamPayload = buildOpenAINonStreamPayloadFromCollectionState(collectionState);
