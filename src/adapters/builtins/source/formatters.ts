@@ -1,4 +1,5 @@
 import type { StandardResponse, StandardResponseReasoning } from '../../../types';
+import { anthropicToolId } from '../anthropic-tool-id';
 import { anthropicInputTokens } from '../../../shared/usage';
 import {
   mapFinishReasonToAnthropic,
@@ -196,7 +197,7 @@ function collectAnthropicContentBlocks(response: StandardResponse): Array<Record
 
     const block: Record<string, unknown> = {
       type: 'tool_use',
-      id: item.call_id || item.id,
+      id: anthropicToolId(item.call_id || item.id),
       name: item.name,
       input: parseFunctionArguments(item.arguments)
     };

@@ -151,6 +151,7 @@ export function enqueueRawTraceCapture(input: RawTraceCaptureInput): void {
 
 class RawTraceManager {
   private readonly limiter: ConcurrencyLimiter;
+  private readonly maxPendingCaptures: number;
   private readonly inflight = new Set<Promise<void>>();
   private initialized = false;
   private warnedDisabled = false;
@@ -161,6 +162,9 @@ class RawTraceManager {
     private readonly logger?: RawTraceLogger,
   ) {
     this.limiter = new ConcurrencyLimiter(config.uploaderConcurrency);
+    // Keep at most two waiting captures per uploader. Queued tasks otherwise
+    // retain every full request/response body during an unavailable host.
+    this.maxPendingCaptures = Math.max(1, config.uploaderConcurrency) * 3;
   }
 
   async initialize(): Promise<void> {
@@ -206,6 +210,12 @@ class RawTraceManager {
           'Raw trace capture skipped because it is disabled.',
         );
       }
+      return;
+    }
+
+    if (this.inflight.size >= this.maxPendingCaptures) {
+      this.logger?.warn?.({ requestId: input.requestId, reason: 'queue_capacity' },
+        'Raw trace capture skipped because the upload queue is full.');
       return;
     }
 

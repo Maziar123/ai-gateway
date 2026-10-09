@@ -5600,7 +5600,7 @@ function buildAnthropicToolUseStartFrame(toolCall: PendingAnthropicToolCall): st
     index: toolCall.blockIndex,
     content_block: {
       type: 'tool_use',
-      id: toolCall.id,
+      id: anthropicToolId(toolCall.id),
       name: toolCall.name,
       input: {}
     }
@@ -6930,3 +6930,4 @@ function encodeSseDataLines(data: unknown): string {
   const lines = serialized.split('\n');
   return lines.map((line) => `data: ${line}`).join('\n');
 }
+import { anthropicToolId } from '../adapters/builtins/anthropic-tool-id';

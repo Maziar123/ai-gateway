@@ -248,6 +248,7 @@ type TransparentToolLoopResult =
       standardRequest: StandardRequest;
       standardResponse: StandardResponse;
       upstreamRequest: UpstreamRequest;
+      upstreamResponse: Response;
       attemptSequence: number;
       upstreamAttemptSequence: number;
     }
@@ -1911,6 +1912,7 @@ export async function handleGatewayRequest(
     }
 
     let responseUpstreamRequest = upstreamRequest;
+    let responseUpstreamResponse = upstreamResponse;
     let responseAttemptSequence = currentAttemptSequence;
     let transformedPayload = responsePluginResult.value;
     let standardPayload = await normalizeOpenAIPayloadForResponseParseRecovery(
@@ -1966,6 +1968,7 @@ export async function handleGatewayRequest(
         }
         if (retryResult.ok) {
           responseUpstreamRequest = retryResult.upstreamRequest;
+          responseUpstreamResponse = retryResult.upstreamResponse;
           responseAttemptSequence = retryResult.attemptSequence;
           transformedPayload = retryResult.transformedPayload;
           standardPayload = retryResult.standardPayload;
@@ -2002,6 +2005,7 @@ export async function handleGatewayRequest(
       initialStandardRequest: standardRequest,
       initialStandardResponse: standardResponseResult.value,
       initialUpstreamRequest: responseUpstreamRequest,
+      initialUpstreamResponse: responseUpstreamResponse,
       initialUpstreamResponseBody: transformedPayload,
       initialAttemptSequence: responseAttemptSequence,
       state: {
@@ -2050,6 +2054,8 @@ export async function handleGatewayRequest(
       }),
       {
         upstreamRequest: transparentToolExecutionResult.upstreamRequest,
+        upstreamResponseStatus: transparentToolExecutionResult.upstreamResponse.status,
+        upstreamResponseHeaders: normalizeHeadersForRawTrace(transparentToolExecutionResult.upstreamResponse.headers),
         upstreamResponseBody: sourcePayload
       }
     );
@@ -2159,6 +2165,7 @@ async function runTransparentToolExecutionLoop(input: {
   initialStandardRequest: StandardRequest;
   initialStandardResponse: StandardResponse;
   initialUpstreamRequest: UpstreamRequest;
+  initialUpstreamResponse: Response;
   initialUpstreamResponseBody: unknown;
   initialAttemptSequence: number;
   state: {
@@ -2171,6 +2178,7 @@ async function runTransparentToolExecutionLoop(input: {
   let workingRequest = input.initialStandardRequest;
   let lastResponse = input.initialStandardResponse;
   let lastUpstreamRequest = input.initialUpstreamRequest;
+  let lastUpstreamResponse = input.initialUpstreamResponse;
   let lastAttemptSequence = input.initialAttemptSequence;
   let lastUpstreamResponseBody = input.initialUpstreamResponseBody;
   let aggregatedUsage = lastResponse.usage;
@@ -2181,6 +2189,7 @@ async function runTransparentToolExecutionLoop(input: {
       standardRequest: workingRequest,
       standardResponse: lastResponse,
       upstreamRequest: lastUpstreamRequest,
+      upstreamResponse: lastUpstreamResponse,
       attemptSequence: lastAttemptSequence,
       upstreamAttemptSequence
     };
@@ -2200,6 +2209,7 @@ async function runTransparentToolExecutionLoop(input: {
           usage: aggregatedUsage
         },
         upstreamRequest: lastUpstreamRequest,
+        upstreamResponse: lastUpstreamResponse,
         attemptSequence: lastAttemptSequence,
         upstreamAttemptSequence
       };
@@ -2281,6 +2291,7 @@ async function runTransparentToolExecutionLoop(input: {
           usage: aggregatedUsage
         },
         upstreamRequest: lastUpstreamRequest,
+        upstreamResponse: lastUpstreamResponse,
         attemptSequence: lastAttemptSequence,
         upstreamAttemptSequence
       };
@@ -2391,6 +2402,7 @@ async function runTransparentToolExecutionLoop(input: {
 
     const { upstreamRequest, upstreamResponse } = upstreamDispatchResult;
     lastUpstreamRequest = upstreamRequest;
+    lastUpstreamResponse = upstreamResponse;
     upstreamAttemptSequence += 1;
     lastAttemptSequence = upstreamAttemptSequence;
     completedModelTurns += 1;
@@ -2521,6 +2533,7 @@ async function runTransparentToolExecutionLoop(input: {
         }
         if (retryResult.ok) {
           lastUpstreamRequest = retryResult.upstreamRequest;
+          lastUpstreamResponse = retryResult.upstreamResponse;
           lastUpstreamResponseBody = retryResult.transformedPayload;
           lastAttemptSequence = retryResult.attemptSequence;
           lastResponse = retryResult.standardResponse;
@@ -2944,11 +2957,22 @@ async function handleVirtualModelRequest(
         upstreamResponse.ok &&
         canTreatAsLiveStreamResponse(source, targetProvider, upstreamResponse)
       ) {
+        // Same protocol on both sides (e.g. anthropic_messages -> anthropic_messages):
+        // the upstream stream is already in the client's dialect, so relaying it
+        // through the protocol converter can only lose events the converter does not
+        // model (Anthropic content_block_*) — pipe it verbatim, exactly as the
+        // non-virtual path does before it ever reaches this branch.
+        const passthroughStream = canPassthroughWithoutProtocolConversion(
+          source.adapterKey,
+          sourceAdapter.provider,
+          targetProvider,
+          targetProviderConfig
+        );
         recordGatewayStreamConversion({
           sourceAdapter: source.adapterKey,
           targetProvider,
           targetProviderName: targetProviderConfig?.name,
-          mode: 'live'
+          mode: passthroughStream ? 'passthrough' : 'live'
         });
         if (shouldBlockLiveStreamingForStrictBilling(config)) {
           await cancelResponseBody(upstreamResponse);
@@ -2981,6 +3005,12 @@ async function handleVirtualModelRequest(
           );
         });
         attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
+        if (passthroughStream) {
+          if (shouldForceEventStreamHeaders(source, isStreaming)) {
+            forceEventStreamHeaders(reply);
+          }
+          return relayUpstreamResponse(reply, upstreamResponse, clientAbortSignal);
+        }
         return relayConvertedStreamFromUpstreamResponse(
           reply,
           source,
@@ -3218,7 +3248,8 @@ async function handleVirtualModelRequest(
         isStreaming,
         model,
         rewrittenBaseRequest,
-        lastUpstreamRequest
+        lastUpstreamRequest,
+        upstreamResponse
       );
       }
 
@@ -3277,7 +3308,8 @@ async function handleVirtualModelRequest(
         isStreaming,
         model,
         rewrittenBaseRequest,
-        lastUpstreamRequest
+        lastUpstreamRequest,
+        upstreamResponse
       );
       }
 
@@ -4587,7 +4619,8 @@ async function* runOptimisticVirtualModelStream(input: {
         publishOptimisticVirtualModelBillingEvent(
           input,
           finalResponse,
-          lastAttemptSequence
+          lastAttemptSequence,
+          buildUpstreamRawTraceCapture(upstreamRequest, upstreamResponse, finalResponse)
         );
         const visibleFunctionCalls = extractFunctionCallsFromStandardResponse(finalResponse);
         if (usesNativeAnthropicTarget) {
@@ -4619,7 +4652,8 @@ async function* runOptimisticVirtualModelStream(input: {
         publishOptimisticVirtualModelBillingEvent(
           input,
           finalResponse,
-          lastAttemptSequence
+          lastAttemptSequence,
+          buildUpstreamRawTraceCapture(upstreamRequest, upstreamResponse, finalResponse)
         );
         if (usesNativeAnthropicTarget) {
           yield* relayOptimisticAnthropicDeferredContent(relay, turnResult, []);
@@ -4764,7 +4798,8 @@ function publishOptimisticVirtualModelBillingEvent(
     model: string;
   },
   response: StandardResponse,
-  attemptSequence: number
+  attemptSequence: number,
+  rawTraceCapture: GatewayRawTraceCapture
 ): void {
   recordGatewaySchedulingUsage({
     config: input.config,
@@ -4775,6 +4810,8 @@ function publishOptimisticVirtualModelBillingEvent(
   });
 
   if (!input.config.billing.enabled || !input.reply) {
+    publishRawTraceCaptureSafe(input.request, input.config, input.targetProvider,
+      response.model || input.model, input.targetProviderConfig, rawTraceCapture);
     return;
   }
 
@@ -4813,7 +4850,8 @@ function publishOptimisticVirtualModelBillingEvent(
     buildGatewayBillingTraceSnapshot(input.request, input.reply, {
       billingTrace: input.config.billing.trace,
       standardResponse: response
-    })
+    }),
+    rawTraceCapture
   ).catch(() => undefined);
 }
 
@@ -4831,7 +4869,8 @@ async function sendVirtualModelResponse(
   streaming: boolean,
   model: string,
   standardRequest?: StandardRequest,
-  upstreamRequest?: UpstreamRequest
+  upstreamRequest?: UpstreamRequest,
+  upstreamResponse?: Response
 ) {
   attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, fallbackAttempts, targetProviderConfig);
 
@@ -4864,6 +4903,8 @@ async function sendVirtualModelResponse(
       }),
       {
         upstreamRequest,
+        upstreamResponseStatus: upstreamResponse?.status,
+        upstreamResponseHeaders: upstreamResponse ? normalizeHeadersForRawTrace(upstreamResponse.headers) : undefined,
         upstreamResponseBody: sourcePayload
       }
     );
@@ -4889,6 +4930,8 @@ async function sendVirtualModelResponse(
     }),
     {
       upstreamRequest,
+      upstreamResponseStatus: upstreamResponse?.status,
+      upstreamResponseHeaders: upstreamResponse ? normalizeHeadersForRawTrace(upstreamResponse.headers) : undefined,
       upstreamResponseBody: sourceStandardResponse
     }
   );

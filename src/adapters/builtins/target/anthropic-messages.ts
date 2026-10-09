@@ -359,7 +359,7 @@ function standardContentToAnthropicBlocks(
     if (item.type === 'tool_use') {
       blocks.push({
         type: 'tool_use',
-        id: item.id,
+        id: anthropicToolId(item.id),
         name: mapStandardToolNameToTargetName(item.name, toolContext.functionTools),
         input: isObject(item.input) ? item.input : {}
       });
@@ -369,7 +369,7 @@ function standardContentToAnthropicBlocks(
     if (item.type === 'tool_search_call') {
       blocks.push({
         type: 'tool_use',
-        id: item.call_id,
+        id: anthropicToolId(item.call_id),
         name: 'ToolSearch',
         input: normalizeAnthropicToolInput(item.arguments)
       });
@@ -384,7 +384,7 @@ function standardContentToAnthropicBlocks(
       }));
       blocks.push({
         type: 'tool_result',
-        tool_use_id: item.call_id,
+        tool_use_id: anthropicToolId(item.call_id),
         content: references.length > 0 ? references : serializeStandardToolSearchOutput(item)
       });
       continue;
@@ -417,7 +417,7 @@ function standardContentToAnthropicBlocks(
       : [];
     const toolResultBlock: Record<string, unknown> = {
       type: 'tool_result',
-      tool_use_id: item.tool_use_id,
+      tool_use_id: anthropicToolId(item.tool_use_id),
       content:
         referenceBlocks.length > 0
           ? [
@@ -732,3 +732,4 @@ function isAnthropicToolChoiceNone(toolChoice: unknown): boolean {
 
   return asString(toolChoice.type) === 'none';
 }
+import { anthropicToolId } from '../anthropic-tool-id';

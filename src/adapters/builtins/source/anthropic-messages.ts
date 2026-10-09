@@ -1,7 +1,8 @@
 import type { SourceAdapter } from '../../../types';
 import { ok } from '../../../types';
-import { asBoolean } from '../../../utils';
+import { asBoolean, isObject } from '../../../utils';
 import { buildAnthropicHeaders } from '../common';
+import { anthropicToolId } from '../anthropic-tool-id';
 import { formatAnthropicMessagesResponse } from './formatters';
 import { parseAnthropicMessagesRequest } from './parsers';
 
@@ -26,7 +27,22 @@ export const anthropicMessagesSourceAdapter: SourceAdapter = {
     return ok({
       url: `${input.config.anthropicBaseUrl}/v1/messages`,
       headers: headersResult.value,
-      body: input.body
+      body: {
+        ...input.body,
+        messages: Array.isArray(input.body.messages) ? input.body.messages.map((message: unknown) => !isObject(message) || Array.isArray(message) ? message : ({
+          ...message,
+          content: Array.isArray(message.content) ? message.content.map((block: unknown) => {
+            if (!isObject(block) || Array.isArray(block)) return block;
+            if (block.type === 'tool_use' || block.type === 'server_tool_use') {
+              return { ...block, id: anthropicToolId(typeof block.id === 'string' ? block.id : undefined) };
+            }
+            if (typeof block.tool_use_id === 'string') {
+              return { ...block, tool_use_id: anthropicToolId(block.tool_use_id) };
+            }
+            return block;
+          }) : message.content
+        })) : input.body.messages
+      }
     });
   }
 };
