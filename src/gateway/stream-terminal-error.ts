@@ -2,6 +2,28 @@ const defaultTerminalErrorMessage = 'Upstream stream failed before the response 
 const upstreamStreamErrorCode = 'upstream_stream_error';
 const defaultTerminalErrorType = 'api_error';
 
+// Transport failures worth naming back to the client: the client cannot discover
+// these from a truncated body, and none of them carries request or credential
+// material. The set is closed on purpose - anything else stays generic, so no
+// provider message, URL or error object can reach the client through this path.
+const knownTransportCodes: Record<string, true> = {
+  EAI_AGAIN: true,
+  ECONNABORTED: true,
+  ECONNREFUSED: true,
+  ECONNRESET: true,
+  EHOSTUNREACH: true,
+  ENETUNREACH: true,
+  EPIPE: true,
+  ETIMEDOUT: true,
+  UND_ERR_BODY_TIMEOUT: true,
+  UND_ERR_CLOSED: true,
+  UND_ERR_CONNECT_TIMEOUT: true,
+  UND_ERR_HEADERS_TIMEOUT: true,
+  UND_ERR_SOCKET: true
+};
+
+const maxTransportCauseDepth = 4;
+
 const terminalSseEventNames: Record<string, true> = {
   error: true,
   message_stop: true,
@@ -32,6 +54,18 @@ export interface StreamTerminalErrorGuardInput {
   adapterKey: string;
   message?: string;
   signal?: AbortSignal;
+}
+
+/**
+ * Adapters that can express a failed stream in-band. Checked before building
+ * anything so a caller can decide support without allocating a frame.
+ */
+function supportsTerminalErrorFrame(adapterKey: string): boolean {
+  return (
+    adapterKey === 'anthropic_messages' ||
+    adapterKey === 'openai_chat' ||
+    adapterKey === 'openai_responses'
+  );
 }
 
 /**
@@ -99,20 +133,29 @@ export function guardStreamTerminalError(
   response: Response,
   input: StreamTerminalErrorGuardInput
 ): Response {
-  const frames = response.body && isEventStreamContentType(response.headers.get('content-type'))
-    ? buildStreamTerminalErrorFrames({ adapterKey: input.adapterKey, message: input.message })
-    : [];
-
-  if (!response.body || frames.length === 0) {
+  const body = response.body;
+  if (
+    !body ||
+    !isEventStreamContentType(response.headers.get('content-type')) ||
+    // An adapter with no in-band error event has nothing to end the stream with,
+    // so the response must pass through untouched.
+    !supportsTerminalErrorFrame(input.adapterKey)
+  ) {
     return response;
   }
 
-  const reader = response.body.getReader();
+  const reader = body.getReader();
   const state: TerminalErrorPumpState = {
     cancelled: false,
     detector: createSseTerminalEventDetector(),
     encoder: new TextEncoder(),
-    frames,
+    // Built only when the stream actually fails, because only then is the
+    // transport failure known - and only then can its identity be reported.
+    buildFrames: (cause) =>
+      buildStreamTerminalErrorFrames({
+        adapterKey: input.adapterKey,
+        message: terminalErrorMessageFor(input.message, cause)
+      }),
     isClientAbort: () => Boolean(input.signal?.aborted)
   };
   const stream = new ReadableStream<Uint8Array>({
@@ -140,8 +183,51 @@ interface TerminalErrorPumpState {
   cancelled: boolean;
   detector: SseTerminalEventDetector;
   encoder: TextEncoder;
-  frames: string[];
+  buildFrames: (cause: unknown) => string[];
   isClientAbort: () => boolean;
+}
+
+/**
+ * The configured message stays authoritative; a recognised transport code is
+ * appended so the client learns why the body stopped without the server ever
+ * copying a provider message into the frame.
+ */
+function terminalErrorMessageFor(configured: string | undefined, cause: unknown): string {
+  const code = readTransportCode(cause);
+  if (!code) {
+    return configured ?? defaultTerminalErrorMessage;
+  }
+
+  const base = configured ?? defaultTerminalErrorMessage;
+  // A configured message that already names the code is a caller's deliberate
+  // wording; appending again would read as a doubled diagnostic.
+  return base.includes(code) ? base : `${base} (transport: ${code})`;
+}
+
+/**
+ * Walks a bounded `code`/`cause` chain and returns the first closed-set transport
+ * code. Nothing else about the error is read: no message, no URL, no object.
+ */
+function readTransportCode(error: unknown): string | undefined {
+  let current: unknown = error;
+
+  for (let depth = 0; depth < maxTransportCauseDepth; depth += 1) {
+    if (!current || typeof current !== 'object') {
+      return undefined;
+    }
+
+    const record = current as { cause?: unknown; code?: unknown };
+    const code = record.code;
+    if (typeof code === 'string' && knownTransportCodes[code] === true) {
+      return code;
+    }
+
+    // Only an explicitly closed set is ever returned, so an unknown code on this
+    // record must not stop the walk - the real cause may be one level deeper.
+    current = record.cause;
+  }
+
+  return undefined;
 }
 
 async function pumpStreamWithTerminalError(
@@ -170,7 +256,12 @@ async function pumpStreamWithTerminalError(
       controller.error(error);
       return;
     }
-    for (const frame of state.frames) {
+    const frames = state.buildFrames(error);
+    if (frames.length === 0) {
+      controller.error(error);
+      return;
+    }
+    for (const frame of frames) {
       controller.enqueue(state.encoder.encode(frame));
     }
     controller.close();

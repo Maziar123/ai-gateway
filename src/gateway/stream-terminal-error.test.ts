@@ -7,7 +7,7 @@ import {
 
 const encoder = new TextEncoder();
 
-function createEventStream(chunks: string[], errorAfter?: Error): Response {
+function createEventStream(chunks: string[], errorAfter?: unknown): Response {
   let index = 0;
   const stream = new ReadableStream<Uint8Array>({
     pull(controller) {
@@ -29,6 +29,15 @@ function createEventStream(chunks: string[], errorAfter?: Error): Response {
     status: 200
   });
 }
+
+function transportError(code: string, message = 'transport detail that must not leak'): Error {
+  const error = new Error(message);
+  (error as Error & { code?: string }).code = code;
+  return error;
+}
+
+const truncatedThinkingChunk =
+  'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"live"}}\n\n';
 
 describe('buildStreamTerminalErrorFrames', () => {
   it('emits an Anthropic error event carrying a typed api error', () => {
@@ -156,5 +165,174 @@ describe('guardStreamTerminalError', () => {
     );
 
     await expect(guarded.text()).rejects.toThrow('aborted');
+  });
+});
+
+describe('guardStreamTerminalError transport identity', () => {
+  it('names a recognised socket code without copying its message', async () => {
+    const guarded = guardStreamTerminalError(
+      createEventStream([truncatedThinkingChunk], transportError('ECONNRESET')),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body.endsWith(
+      'event: error\ndata: {"error":{"code":"upstream_stream_error","message":"Upstream stream failed. (transport: ECONNRESET)","type":"api_error"},"type":"error"}\n\n'
+    )).toBe(true);
+    expect(body).not.toContain('transport detail that must not leak');
+  });
+
+  it('finds the code nested in a cause chain', async () => {
+    const inner = transportError('UND_ERR_SOCKET', 'socket closed while reading');
+    const middle = new Error('fetch failed', { cause: inner });
+    const outer = new Error('upstream request failed', { cause: middle });
+
+    const guarded = guardStreamTerminalError(
+      createEventStream([truncatedThinkingChunk], outer),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body).toContain('"message":"Upstream stream failed. (transport: UND_ERR_SOCKET)"');
+    for (const leaked of ['socket closed while reading', 'fetch failed', 'upstream request failed']) {
+      expect(body).not.toContain(leaked);
+    }
+  });
+
+  it('keeps the OpenAI chat framing when the failure is identified', async () => {
+    const guarded = guardStreamTerminalError(
+      createEventStream(['data: {"choices":[]}\n\n'], transportError('ETIMEDOUT')),
+      { adapterKey: 'openai_chat', message: 'Upstream stream failed.' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body.endsWith(
+      'data: {"error":{"code":"upstream_stream_error","message":"Upstream stream failed. (transport: ETIMEDOUT)","type":"api_error"}}\n\ndata: [DONE]\n\n'
+    )).toBe(true);
+  });
+
+  it('keeps the failed Responses framing when the failure is identified', async () => {
+    const guarded = guardStreamTerminalError(
+      createEventStream(['data: {"type":"response.created"}\n\n'], transportError('EPIPE')),
+      { adapterKey: 'openai_responses', message: 'Upstream stream failed.' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body.endsWith(
+      'event: response.failed\ndata: {"response":{"error":{"code":"upstream_stream_error","message":"Upstream stream failed. (transport: EPIPE)","type":"api_error"},"object":"response","status":"failed"},"type":"response.failed"}\n\ndata: [DONE]\n\n'
+    )).toBe(true);
+  });
+
+  it('falls back to the default message plus the code when none is configured', async () => {
+    const guarded = guardStreamTerminalError(
+      createEventStream([truncatedThinkingChunk], transportError('EAI_AGAIN')),
+      { adapterKey: 'anthropic_messages' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body).toContain(
+      '"message":"Upstream stream failed before the response completed. (transport: EAI_AGAIN)"'
+    );
+  });
+
+  it('refuses an unknown code and a private message', async () => {
+    const guarded = guardStreamTerminalError(
+      createEventStream(
+        [truncatedThinkingChunk],
+        transportError('ERR_SOMETHING_PRIVATE', 'secret upstream body at https://internal/route')
+      ),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body.endsWith(
+      'event: error\ndata: {"error":{"code":"upstream_stream_error","message":"Upstream stream failed.","type":"api_error"},"type":"error"}\n\n'
+    )).toBe(true);
+    expect(body).not.toContain('ERR_SOMETHING_PRIVATE');
+    expect(body).not.toContain('secret upstream body');
+    expect(body).not.toContain('internal/route');
+  });
+
+  it('ignores a code carried in the message when the error has none', async () => {
+    const guarded = guardStreamTerminalError(
+      createEventStream([truncatedThinkingChunk], new Error('read ECONNRESET on socket')),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body.endsWith(
+      'event: error\ndata: {"error":{"code":"upstream_stream_error","message":"Upstream stream failed.","type":"api_error"},"type":"error"}\n\n'
+    )).toBe(true);
+    expect(body).not.toContain('(transport:');
+  });
+
+  it('survives a circular cause chain without reporting a code', async () => {
+    const first = new Error('first');
+    const second = new Error('second', { cause: first });
+    (first as Error & { cause?: unknown }).cause = second;
+
+    const guarded = guardStreamTerminalError(
+      createEventStream([truncatedThinkingChunk], first),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body).toContain('"message":"Upstream stream failed."');
+    expect(body).not.toContain('(transport:');
+  });
+
+  it('accepts a recognised code on the thrown error itself when the cause is unrelated', async () => {
+    const failure = transportError('ECONNREFUSED', 'connect ECONNREFUSED 10.0.0.1:443');
+
+    const guarded = guardStreamTerminalError(
+      createEventStream([truncatedThinkingChunk], failure),
+      { adapterKey: 'anthropic_messages' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body).toContain('(transport: ECONNREFUSED)');
+    expect(body).not.toContain('10.0.0.1');
+  });
+});
+
+describe('guardStreamTerminalError frame accounting', () => {
+  it('writes no extra frame once a terminal event already arrived', async () => {
+    const guarded = guardStreamTerminalError(
+      createEventStream(
+        ['event: message_stop\ndata: {"type":"message_stop"}\n\n'],
+        transportError('ECONNRESET')
+      ),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    await expect(guarded.text()).rejects.toThrow('transport detail that must not leak');
+  });
+
+  it('writes no frame after the client aborted, even with a recognised code', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const guarded = guardStreamTerminalError(
+      createEventStream(['data: {"choices":[]}\n\n'], transportError('ECONNRESET')),
+      { adapterKey: 'openai_chat', message: 'Upstream stream failed.', signal: controller.signal }
+    );
+
+    await expect(guarded.text()).rejects.toThrow('transport detail that must not leak');
+  });
+
+  it('keeps the identity passthrough for an unknown adapter', () => {
+    const response = createEventStream(['data: {"candidates":[]}\n\n']);
+
+    expect(guardStreamTerminalError(response, { adapterKey: 'gemini_generate_content' })).toBe(
+      response
+    );
   });
 });
