@@ -290,7 +290,7 @@ describe('guardStreamTerminalError transport identity', () => {
   });
 
   it('accepts a recognised code on the thrown error itself when the cause is unrelated', async () => {
-    const failure = transportError('ECONNREFUSED', 'connect ECONNREFUSED 10.0.0.1:443');
+    const failure = transportError('ECONNREFUSED', 'connect ECONNREFUSED 192.0.2.1:443');
 
     const guarded = guardStreamTerminalError(
       createEventStream([truncatedThinkingChunk], failure),
@@ -300,7 +300,7 @@ describe('guardStreamTerminalError transport identity', () => {
     const body = await guarded.text();
 
     expect(body).toContain('(transport: ECONNREFUSED)');
-    expect(body).not.toContain('10.0.0.1');
+    expect(body).not.toContain('192.0.2.1');
   });
 });
 
